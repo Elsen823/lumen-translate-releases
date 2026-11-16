@@ -112,10 +112,11 @@ jobs:
             # Name each file after its attachment and shrink screenshots to small JPEGs, so the
             # artifact downloads quickly; accessibility trees go into this log as well.
             python3 - <<'PY'
-          import json, os, subprocess
+          import json, os, re, subprocess
           for test in json.load(open("manifest.json")):
               for item in test["attachments"]:
-                  name = item["suggestedHumanReadableName"].rsplit("_", 2)[0]
+                  # Artifact paths can't hold quotes, colons and similar characters.
+                  name = re.sub(r"[^A-Za-z0-9 ._-]+", "-", item["suggestedHumanReadableName"].rsplit("_", 2)[0])
                   source = item["exportedFileName"]
                   if source.endswith(".png"):
                       subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "70", "-Z", "1200",
