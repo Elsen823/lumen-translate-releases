@@ -108,7 +108,26 @@ jobs:
         run: |
           if [ -d build/UITests.xcresult ]; then
             xcrun xcresulttool export attachments --path build/UITests.xcresult --output-path build/attachments || true
-            ls -la build/attachments || true
+            cd build/attachments || exit 0
+            # Name each file after its attachment and shrink screenshots to small JPEGs, so the
+            # artifact downloads quickly; accessibility trees go into this log as well.
+            python3 - <<'PY'
+          import json, os, subprocess
+          for test in json.load(open("manifest.json")):
+              for item in test["attachments"]:
+                  name = item["suggestedHumanReadableName"].rsplit("_", 2)[0]
+                  source = item["exportedFileName"]
+                  if source.endswith(".png"):
+                      subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "70", "-Z", "1200",
+                                      source, "--out", f"{name}.jpg"], check=False, capture_output=True)
+                      os.remove(source)
+                  elif source.endswith(".txt"):
+                      os.rename(source, f"{name}.txt")
+                      print(f"::group::{name}")
+                      print(open(f"{name}.txt", encoding="utf-8", errors="replace").read()[:30000])
+                      print("::endgroup::")
+          PY
+            ls -la
           fi
 
       - name: Upload test evidence
