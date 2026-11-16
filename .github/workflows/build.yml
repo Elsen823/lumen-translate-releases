@@ -121,6 +121,8 @@ jobs:
                       subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "70", "-Z", "1200",
                                       source, "--out", f"{name}.jpg"], check=False, capture_output=True)
                       os.remove(source)
+                  elif source.endswith(".mp4"):
+                      os.remove(source)  # the failure recording is tens of megabytes
                   elif source.endswith(".txt"):
                       os.rename(source, f"{name}.txt")
                       print(f"::group::{name}")
