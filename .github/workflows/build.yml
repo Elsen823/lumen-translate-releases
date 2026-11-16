@@ -1,0 +1,188 @@
+name: Build
+
+# Builds and tests Lumen Translate from its private source repository, and on request publishes
+# the IPA as a release here. The source is checked out with a read-only deploy key
+# (secret SOURCE_DEPLOY_KEY); nothing from it is published except build logs, test screenshots
+# and the IPA.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of the source to build
+        required: true
+        default: main
+      release:
+        description: Tag to publish the IPA under, for example v0.1.0 (empty publishes nothing)
+        required: false
+        default: ""
+
+concurrency:
+  group: build-${{ inputs.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: Elsen823/lumen-translate
+
+jobs:
+  test:
+    name: Core tests, app, extension and UI tests (iOS Simulator)
+    runs-on: macos-26
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: source
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          xcodebuild -version
+          git log -1 --format='Source commit %H: %s'
+
+      - name: Core tests
+        run: swift test --package-path Packages/TranslateKit 2>&1 | grep -vE "^\[[0-9]+/[0-9]+\]" | tail -80
+
+      - name: Generate the project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Pick a simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          phones = [(rt, d) for rt, ds in devices.items() if "iOS" in rt for d in ds if d["name"].startswith("iPhone")]
+          phones.sort(key=lambda p: (p[0], p[1]["name"]))
+          print(phones[-1][1]["udid"])')
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl list devices | grep "$UDID"
+
+      # Simulator builds are signed to run locally ("-"), which embeds the entitlements the
+      # simulator enforces: the Translation capability and the app group.
+      - name: Build for testing
+        run: |
+          mkdir -p build
+          if ! xcodebuild build-for-testing \
+            -project LumenTranslate.xcodeproj -scheme LumenTranslate \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath build \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= \
+            > build/build.log 2>&1; then
+            grep -E "error:" build/build.log | sort -u | head -60
+            tail -40 build/build.log
+            exit 1
+          fi
+          grep -E "warning:" build/build.log | grep -v "/SourcePackages/" | sort -u | head -40 || true
+          tail -3 build/build.log
+
+      - name: Check the bundle
+        run: scripts/check-bundle.sh build/Build/Products/Debug-iphonesimulator/LumenTranslate.app
+
+      - name: UI tests
+        run: |
+          status=0
+          xcodebuild test-without-building \
+            -project LumenTranslate.xcodeproj -scheme LumenTranslate \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath build -resultBundlePath build/UITests.xcresult \
+            > build/test.log 2>&1 || status=$?
+          grep -E "Test Case|error:|Executed|skipped|\*\* TEST" build/test.log || tail -40 build/test.log
+          exit $status
+
+      - name: Export screenshots
+        if: always()
+        run: |
+          if [ -d build/UITests.xcresult ]; then
+            xcrun xcresulttool export attachments --path build/UITests.xcresult --output-path build/attachments || true
+            ls -la build/attachments || true
+          fi
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-test-evidence
+          path: |
+            source/build/attachments
+            source/build/build.log
+            source/build/test.log
+          if-no-files-found: ignore
+
+  ipa:
+    name: Installable IPA
+    runs-on: macos-26
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: source
+
+      - name: Select Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+
+      - name: Build
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          mkdir -p build
+          if ! xcodebuild build \
+            -project LumenTranslate.xcodeproj -scheme LumenTranslate \
+            -configuration Release -sdk iphoneos -destination "generic/platform=iOS" \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO \
+            > build/build.log 2>&1; then
+            grep -E "error:" build/build.log | sort -u | head -60
+            tail -40 build/build.log
+            exit 1
+          fi
+          tail -3 build/build.log
+
+      - name: Package
+        run: scripts/package-ipa.sh build/Build/Products/Release-iphoneos/LumenTranslate.app build/LumenTranslate.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LumenTranslate-ipa
+          path: source/build/LumenTranslate.ipa
+
+  release:
+    name: Publish release
+    if: inputs.release != ''
+    needs: [test, ipa]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: LumenTranslate-ipa
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release }}
+        run: |
+          gh release create "$TAG" LumenTranslate.ipa --repo "$GITHUB_REPOSITORY" \
+            --title "Lumen Translate $TAG" \
+            --notes "Ad-hoc signed IPA for sideloading (SideStore, AltStore). Sideloaded builds can't carry the Translation capability, so they work as a translator but aren't offered as the default translation app."
